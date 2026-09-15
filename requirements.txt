@@ -1,0 +1,18 @@
+# Hyperliquid Arb Framework — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Hyperliquid official SDK
+hyperliquid-python-sdk>=0.9.0
+
+# Async HTTP client
+aiohttp>=3.9.0
+
+# WebSocket client
+websockets>=12.0
+
+# Ethereum signing (EIP-712)
+eth-account>=0.11.0
+eth-abi>=4.2.0
+
+# Utilities
+python-dotenv>=1.0.0      # optional: load PRIVATE_KEY from .env file
