@@ -22,6 +22,7 @@ import msgpack
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_hex
+from hyperliquid.utils.signing import sign_l1_action
 
 from logger import logger, alert
 import config
@@ -79,6 +80,8 @@ class OrderManager:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._account = Account.from_key(config.PRIVATE_KEY)
+        if self._account.address.lower() != config.WALLET_ADDRESS.lower():
+            raise RuntimeError("WALLET_ADDRESS does not match the address derived from API_KEY")
         self._orders: Dict[str, Order] = {}   # client_id -> Order
         self._asset_index: Dict[str, int] = {}  # populated on first meta fetch
 
@@ -364,36 +367,14 @@ class OrderManager:
         return None
 
     def _sign(self, action: dict, nonce: int) -> dict:
-        """
-        EIP-712 signing for Hyperliquid exchange actions.
-        See: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
-        """
-        connection_id = bytes(32)   # mainnet = 32 zero bytes
-        action_hash = self._hash_action(action, nonce, connection_id)
-        phantom_agent = {
-            "source": "a",
-            "connectionId": action_hash,
-        }
-        domain = {
-            "chainId": 1337,
-            "name": "Exchange",
-            "verifyingContract": "0x0000000000000000000000000000000000000000",
-            "version": "1",
-        }
-        types = {
-            "Agent": [
-                {"name": "source",       "type": "string"},
-                {"name": "connectionId", "type": "bytes32"},
-            ]
-        }
-        structured = {
-            "domain": domain,
-            "types": types,
-            "primaryType": "Agent",
-            "message": phantom_agent,
-        }
-        signed = self._account.sign_message(encode_typed_data(full_message=structured))
-        return {"r": to_hex(signed["r"]), "s": to_hex(signed["s"]), "v": signed["v"]}
+        return sign_l1_action(
+            self._account,
+            action,
+            None,
+            nonce,
+            None,
+            True,
+        )
 
     def _hash_action(self, action: dict, nonce: int, connection_id: bytes) -> bytes:
         action_bytes = msgpack.packb(action)

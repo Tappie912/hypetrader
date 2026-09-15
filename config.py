@@ -45,6 +45,7 @@ ARB_PAIRS = [
     ("ETH", "ETH"),   # ETH perp vs ETH spot
     ("BTC", "BTC"),   # BTC perp vs BTC spot
     ("SOL", "SOL"),   # SOL perp vs SOL spot
+    ("HYPE", "HYPE"), # HYPE perp vs HYPE spot
 ]
 
 # Hyperliquid spot market identifiers for the wrapped assets above.
