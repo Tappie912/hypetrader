@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
 import websockets
 
-from utils.logger import logger, alert
+from logger import logger, alert
 import config
 
 
@@ -87,8 +87,7 @@ class MarketDataFeed:
             logger.debug(f"Subscribed perp l2Book: {asset}")
 
     async def subscribe_spot(self, asset: str) -> None:
-        # Spot coins use "@spot" suffix on Hyperliquid WS
-        coin = f"{asset}@spot" if not asset.endswith("@spot") else asset
+        coin = config.SPOT_COINS.get(asset, asset)
         sub = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}
         self._subscriptions.append((sub, asset, "spot"))
         if self._ws:
@@ -151,8 +150,9 @@ class MarketDataFeed:
         coin   = data.get("coin", "")
         levels = data.get("levels", [[], []])
 
-        is_spot = coin.endswith("@spot")
-        asset   = coin.replace("@spot", "")
+        spot_assets = {coin: asset for asset, coin in config.SPOT_COINS.items()}
+        is_spot = coin in spot_assets or "/" in coin
+        asset = spot_assets.get(coin, coin.split("/", 1)[0] if is_spot else coin)
         market  = "spot" if is_spot else "perp"
 
         bids = levels[0]  # list of {"px": str, "sz": str, "n": int}

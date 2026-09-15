@@ -19,15 +19,16 @@ Note: Funding rate is an additional P&L source for this strategy —
 """
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
-from core.feed import MarketDataFeed, BookSnapshot
-from core.order_manager import OrderManager, Order, Side, TIF
-from core.risk_manager import RiskManager
-from utils.logger import logger, alert
+from feed import MarketDataFeed, BookSnapshot
+from order_manager import OrderManager, Order, Side, TIF
+from risk_manager import RiskManager
+from logger import logger, alert
 import config
 
 
@@ -162,13 +163,17 @@ class PerpSpotArbStrategy:
             spot_price = spot.ask_price   # buy at ask
         else:
             # Perp discount: long perp, short spot
+            if not config.ALLOW_SPOT_SELL:
+                logger.debug(f"Skipping {pos.asset}: spot shorting is disabled")
+                return
             perp_side = Side.BUY
             spot_side = Side.SELL
             perp_price = perp.ask_price   # buy at ask
             spot_price = spot.bid_price   # sell into bid
 
         # Size: use conservative size based on limits
-        size = self._calc_size(perp_price)
+        # Both legs share this size; cap against the more expensive leg.
+        size = self._calc_size(pos.asset, max(perp_price, spot_price))
         if size <= 0:
             return
 
@@ -203,6 +208,14 @@ class PerpSpotArbStrategy:
                 market="spot", tif=TIF.GTC,
             ),
         )
+
+        if not perp_order or not spot_order or perp_order.status == "error" or spot_order.status == "error":
+            logger.error(f"Arb entry rejected for {pos.asset}; resetting without opening a position")
+            for order in (perp_order, spot_order):
+                if order and order.status == "open":
+                    await self._orders.cancel(order)
+            pos.state = ArbState.FLAT
+            return
 
         pos.perp_leg = ArbLeg(order=perp_order)
         pos.spot_leg = ArbLeg(order=spot_order)
@@ -287,14 +300,15 @@ class PerpSpotArbStrategy:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _calc_size(self, price: float) -> float:
+    def _calc_size(self, asset: str, price: float) -> float:
         if price <= 0:
             return 0.0
         max_by_order = config.MAX_ORDER_USD / price
         max_by_pos   = config.MAX_POSITION_USD / price
         size = min(max_by_order, max_by_pos)
-        # Round to reasonable precision
-        return round(size, 4)
+        decimals = config.SIZE_DECIMALS.get(asset, 4)
+        scale = 10 ** decimals
+        return math.floor(size * scale) / scale
 
     async def _send_pnl_summary(self) -> None:
         lines = ["📊 *PnL Summary*"]

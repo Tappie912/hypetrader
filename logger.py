@@ -18,9 +18,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
 
+class ConsoleFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        return message.encode("ascii", errors="replace").decode("ascii")
+
+
 def setup_logger(name: str = "hl_arb") -> logging.Logger:
     """Set up a rotating file + console logger."""
     os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
@@ -32,7 +42,7 @@ def setup_logger(name: str = "hl_arb") -> logging.Logger:
 
     # Console handler
     ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
+    ch.setFormatter(ConsoleFormatter(fmt._fmt, fmt.datefmt))
     logger.addHandler(ch)
 
     # Rotating file handler
@@ -40,6 +50,7 @@ def setup_logger(name: str = "hl_arb") -> logging.Logger:
         config.LOG_FILE,
         maxBytes=config.LOG_ROTATE_MB * 1024 * 1024,
         backupCount=config.LOG_BACKUP_COUNT,
+        encoding="utf-8",
     )
     fh.setFormatter(fmt)
     logger.addHandler(fh)

@@ -12,18 +12,18 @@ Supports:
 """
 
 import asyncio
-import hashlib
 import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 import aiohttp
+import msgpack
 from eth_account import Account
-from eth_account.structured_data.hashing import hash_domain, hash_message
-from eth_abi import encode
+from eth_account.messages import encode_typed_data
+from eth_utils import keccak, to_hex
 
-from utils.logger import logger, alert
+from logger import logger, alert
 import config
 
 
@@ -226,14 +226,20 @@ class OrderManager:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _submit(self, order: Order) -> Optional[Order]:
-        asset_idx = self._asset_index.get(order.asset)
+        asset_idx = (
+            config.SPOT_ASSET_INDICES.get(order.asset)
+            if order.market == "spot"
+            else self._asset_index.get(order.asset)
+        )
         if asset_idx is None:
             logger.error(f"Asset not found in index: {order.asset}")
-            return None
+            order.status = "error"
+            self._orders[order.client_id] = order
+            return order
 
         wire_order = self._build_order_wire(
             order.asset, order.side, order.size,
-            order.price, order.tif, order.reduce_only,
+            order.price, order.tif, order.reduce_only, order.market,
         )
         action = {
             "type": "order",
@@ -244,12 +250,42 @@ class OrderManager:
 
         if not resp:
             order.status = "error"
+            self._orders[order.client_id] = order
             return order
 
-        statuses = resp.get("response", {}).get("data", {}).get("statuses", [])
+        if not isinstance(resp, dict):
+            order.status = "error"
+            logger.error(f"Order request returned an unexpected response: {resp!r}")
+            self._orders[order.client_id] = order
+            return order
+
+        response = resp.get("response")
+        if not isinstance(response, dict):
+            order.status = "error"
+            logger.error(f"Order rejected by exchange: {resp!r}")
+            self._orders[order.client_id] = order
+            return order
+
+        data = response.get("data")
+        if not isinstance(data, dict):
+            order.status = "error"
+            logger.error(f"Order response missing data: {resp!r}")
+            self._orders[order.client_id] = order
+            return order
+
+        statuses = data.get("statuses", [])
+        if not isinstance(statuses, list):
+            order.status = "error"
+            logger.error(f"Order response has invalid statuses: {resp!r}")
+            self._orders[order.client_id] = order
+            return order
+
         if statuses:
             st = statuses[0]
-            if "resting" in st:
+            if not isinstance(st, dict):
+                order.status = "error"
+                logger.error(f"Order status has unexpected shape: {st!r}")
+            elif "resting" in st:
                 order.hl_oid = st["resting"]["oid"]
                 order.status = "open"
                 logger.info(f"Order placed: {order.client_id} | {order.side.name} {order.size} {order.asset} @ {order.price} | oid={order.hl_oid}")
@@ -274,9 +310,13 @@ class OrderManager:
 
     def _build_order_wire(
         self, asset: str, side: Side, size: float, price: float,
-        tif: TIF, reduce_only: bool,
+        tif: TIF, reduce_only: bool, market: str = "perp",
     ) -> dict:
-        asset_idx = self._asset_index.get(asset, 0)
+        asset_idx = (
+            config.SPOT_ASSET_INDICES.get(asset, 0)
+            if market == "spot"
+            else self._asset_index.get(asset, 0)
+        )
         is_buy = side == Side.BUY
 
         if price == 0.0:
@@ -352,18 +392,16 @@ class OrderManager:
             "primaryType": "Agent",
             "message": phantom_agent,
         }
-        signed = self._account.sign_typed_data(
-            domain_data=domain,
-            message_types=types,
-            message_data=phantom_agent,
-        )
-        return {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
+        signed = self._account.sign_message(encode_typed_data(full_message=structured))
+        return {"r": to_hex(signed["r"]), "s": to_hex(signed["s"]), "v": signed["v"]}
 
     def _hash_action(self, action: dict, nonce: int, connection_id: bytes) -> bytes:
-        action_bytes = json.dumps(action, separators=(",", ":"), sort_keys=True).encode()
+        action_bytes = msgpack.packb(action)
         nonce_bytes  = nonce.to_bytes(8, "big")
-        payload = action_bytes + nonce_bytes + b"\x00" + connection_id
-        return hashlib.sha3_256(payload).digest()
+        # Current Hyperliquid L1 actions encode a missing active pool as 0x00.
+        # The legacy connection ID is not included for this order payload.
+        payload = action_bytes + nonce_bytes + b"\x00"
+        return keccak(payload)
 
     async def _load_asset_indices(self) -> None:
         resp = await self._info_post({"type": "meta"})

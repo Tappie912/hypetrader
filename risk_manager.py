@@ -14,8 +14,8 @@ Call RiskManager.check() before every order. If it returns False, do NOT trade.
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from utils.logger import logger, alert
-from core.order_manager import Position, Side
+from logger import logger, alert
+from order_manager import Position, Side
 import config
 
 
@@ -71,15 +71,16 @@ class RiskManager:
             return False, f"Trading halted: {self.state.halt_reason}"
 
         notional = size * price
+        tolerance = 1e-9
 
         # Single order cap
-        if notional > config.MAX_ORDER_USD:
+        if notional > config.MAX_ORDER_USD + tolerance:
             return False, f"Order notional ${notional:.0f} exceeds limit ${config.MAX_ORDER_USD}"
 
         # Per-position cap
         key = f"{asset}_{market}"
         existing = self._position_notionals.get(key, 0.0)
-        if existing + notional > config.MAX_POSITION_USD:
+        if existing + notional > config.MAX_POSITION_USD + tolerance:
             return False, (
                 f"Position notional ${existing + notional:.0f} would exceed "
                 f"limit ${config.MAX_POSITION_USD} for {asset} {market}"
@@ -87,7 +88,7 @@ class RiskManager:
 
         # Total exposure cap
         total = sum(self._position_notionals.values()) + notional
-        if total > config.MAX_TOTAL_EXPOSURE_USD:
+        if total > config.MAX_TOTAL_EXPOSURE_USD + tolerance:
             return False, f"Total exposure ${total:.0f} would exceed limit ${config.MAX_TOTAL_EXPOSURE_USD}"
 
         return True, "ok"

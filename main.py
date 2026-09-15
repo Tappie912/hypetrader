@@ -19,11 +19,11 @@ import argparse
 import signal
 import sys
 
-from core.feed import MarketDataFeed
-from core.order_manager import OrderManager
-from core.risk_manager import RiskManager
-from strategies.perp_spot_arb import PerpSpotArbStrategy
-from utils.logger import logger, alert
+from feed import MarketDataFeed
+from order_manager import OrderManager
+from risk_manager import RiskManager
+from perp_spot_arb import PerpSpotArbStrategy
+from logger import logger, alert
 import config
 
 
@@ -82,8 +82,15 @@ async def main(close_on_exit: bool = False) -> None:
         logger.info(f"Received {sig.name} — shutting down…")
         stop_event.set()
 
+    loop = asyncio.get_running_loop()
     for s in (signal.SIGINT, signal.SIGTERM):
-        asyncio.get_event_loop().add_signal_handler(s, _shutdown, s)
+        if sys.platform == "win32":
+            signal.signal(
+                s,
+                lambda _signum, _frame, sig=s: loop.call_soon_threadsafe(_shutdown, sig),
+            )
+        else:
+            loop.add_signal_handler(s, _shutdown, s)
 
     await stop_event.wait()
 
