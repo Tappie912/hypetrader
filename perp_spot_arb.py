@@ -54,6 +54,7 @@ class ArbPosition:
     entry_spread_bps: float = 0.0
     entry_time: float = field(default_factory=time.time)
     realized_pnl: float = 0.0
+    last_status_check: float = 0.0
 
     @property
     def age_secs(self) -> float:
@@ -137,7 +138,7 @@ class PerpSpotArbStrategy:
                 await self._check_entry_fills(pos)
 
             elif pos.state == ArbState.OPEN:
-                await self._check_exit(pos, spread_bps)
+                await self._check_exit(pos, spread_bps, perp_book, spot_book)
 
             elif pos.state == ArbState.CLOSING:
                 await self._check_close_fills(pos)
@@ -201,30 +202,87 @@ class PerpSpotArbStrategy:
         perp_order, spot_order = await asyncio.gather(
             self._orders.place_limit(
                 pos.asset, perp_side, size, perp_price,
-                market="perp", tif=TIF.GTC,
+                market="perp", tif=TIF.IOC,
             ),
             self._orders.place_limit(
                 pos.asset, spot_side, size, spot_price,
-                market="spot", tif=TIF.GTC,
+                market="spot", tif=TIF.IOC,
             ),
         )
 
         if not perp_order or not spot_order or perp_order.status == "error" or spot_order.status == "error":
-            logger.error(f"Arb entry rejected for {pos.asset}; resetting without opening a position")
+            logger.error(f"Arb entry rejected for {pos.asset}; unwinding any filled leg")
             for order in (perp_order, spot_order):
                 if order and order.status == "open":
                     await self._orders.cancel(order)
-            pos.state = ArbState.FLAT
+            await self._unwind_entry_fills(pos, perp_order, spot_order)
             return
 
         pos.perp_leg = ArbLeg(order=perp_order)
         pos.spot_leg = ArbLeg(order=spot_order)
         pos.entry_spread_bps = spread_bps
         pos.entry_time = time.time()
+        pos.last_status_check = 0.0
         pos.state = ArbState.ENTERING
+
+    async def _unwind_entry_fills(
+        self,
+        pos: ArbPosition,
+        perp_order: Optional[Order],
+        spot_order: Optional[Order],
+    ) -> None:
+        """Close confirmed fills when the paired entry leg fails."""
+        unwind_orders = []
+        for order, market in ((perp_order, "perp"), (spot_order, "spot")):
+            if not order or order.filled <= 0:
+                unwind_orders.append(None)
+                continue
+            book = self._feed.get_book(pos.asset, market)
+            if not book:
+                logger.critical(f"Cannot unwind filled {pos.asset} {market}: no book")
+                unwind_orders.append(None)
+                continue
+            close_side = Side.BUY if order.side == Side.SELL else Side.SELL
+            unwind_orders.append(await self._orders.place_market(
+                pos.asset,
+                close_side,
+                order.filled,
+                market=market,
+                reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
+                price=self._marketable_price(book, close_side),
+            ))
+
+        active_unwinds = [order for order in unwind_orders if order is not None]
+        if not active_unwinds:
+            pos.state = ArbState.FLAT
+            return
+
+        # IOC unwind orders should resolve immediately. Keep the position in
+        # CLOSING until every compensating order is terminal.
+        await asyncio.gather(*[
+            self._orders.refresh_order(order) for order in active_unwinds
+        ])
+        if all(order.status in ("filled", "cancelled") for order in active_unwinds):
+            logger.info(f"Failed entry unwound for {pos.asset}")
+            pos.state = ArbState.FLAT
+            return
+
+        logger.critical(f"Failed entry could not be fully unwound for {pos.asset}")
+        pos.perp_leg = ArbLeg(order=unwind_orders[0])
+        pos.spot_leg = ArbLeg(order=unwind_orders[1])
+        pos.entry_time = time.time()
+        pos.last_status_check = 0.0
+        pos.state = ArbState.CLOSING
 
     async def _check_entry_fills(self, pos: ArbPosition) -> None:
         """Wait for both legs to fill. Cancel and reset if one leg times out."""
+        if time.time() - pos.last_status_check >= 0.5:
+            await asyncio.gather(
+                self._orders.refresh_order(pos.perp_leg.order),
+                self._orders.refresh_order(pos.spot_leg.order),
+            )
+            pos.last_status_check = time.time()
+
         perp_filled = pos.perp_leg.order and pos.perp_leg.order.status == "filled"
         spot_filled = pos.spot_leg.order and pos.spot_leg.order.status == "filled"
 
@@ -243,11 +301,51 @@ class PerpSpotArbStrategy:
             for leg in (pos.perp_leg, pos.spot_leg):
                 if leg.order and leg.order.status == "open":
                     await self._orders.cancel(leg.order)
-            pos.state = ArbState.FLAT
+
+            # Never leave a partially filled leg exposed after the other leg
+            # times out. Close only the quantity confirmed filled by the exchange.
+            unwind_orders = []
+            for leg, market in (
+                (pos.perp_leg, "perp"),
+                (pos.spot_leg, "spot"),
+            ):
+                order = leg.order
+                if not order or order.filled <= 0:
+                    unwind_orders.append(None)
+                    continue
+                book = self._feed.get_book(pos.asset, market)
+                if not book:
+                    logger.error(f"Cannot unwind partial {pos.asset} {market}: no book")
+                    unwind_orders.append(None)
+                    continue
+                close_side = Side.BUY if order.side == Side.SELL else Side.SELL
+                unwind_orders.append(await self._orders.place_market(
+                    pos.asset,
+                    close_side,
+                    order.filled,
+                    market=market,
+                    reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
+                    price=self._marketable_price(book, close_side),
+                ))
+
+            if any(unwind_orders):
+                pos.perp_leg = ArbLeg(order=unwind_orders[0])
+                pos.spot_leg = ArbLeg(order=unwind_orders[1])
+                pos.entry_time = time.time()
+                pos.last_status_check = 0.0
+                pos.state = ArbState.CLOSING
+            else:
+                pos.state = ArbState.FLAT
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
-    async def _check_exit(self, pos: ArbPosition, spread_bps: float) -> None:
+    async def _check_exit(
+        self,
+        pos: ArbPosition,
+        spread_bps: float,
+        perp_book: BookSnapshot,
+        spot_book: BookSnapshot,
+    ) -> None:
         should_close = abs(spread_bps) <= config.CLOSE_SPREAD_BPS
 
         if not should_close:
@@ -266,26 +364,48 @@ class PerpSpotArbStrategy:
         # Close each leg in opposite direction, reduce-only
         close_perp_side = Side.BUY  if perp_order.side == Side.SELL else Side.SELL
         close_spot_side = Side.BUY  if spot_order.side == Side.SELL else Side.SELL
+        close_perp_price = self._marketable_price(perp_book, close_perp_side)
+        close_spot_price = self._marketable_price(spot_book, close_spot_side)
 
         close_perp, close_spot = await asyncio.gather(
             self._orders.place_market(
-                pos.asset, close_perp_side, perp_order.size,
+                pos.asset, close_perp_side, perp_order.filled or perp_order.size,
                 market="perp", reduce_only=config.REDUCE_ONLY_ON_CLOSE,
+                price=close_perp_price,
             ),
             self._orders.place_market(
-                pos.asset, close_spot_side, spot_order.size,
+                pos.asset, close_spot_side, spot_order.filled or spot_order.size,
                 market="spot", reduce_only=False,
+                price=close_spot_price,
             ),
         )
 
         pos.perp_leg = ArbLeg(order=close_perp)
         pos.spot_leg = ArbLeg(order=close_spot)
         pos.entry_time = time.time()
+        pos.last_status_check = 0.0
         pos.state = ArbState.CLOSING
 
     async def _check_close_fills(self, pos: ArbPosition) -> None:
-        perp_done = pos.perp_leg.order and pos.perp_leg.order.status in ("filled", "cancelled")
-        spot_done = pos.spot_leg.order and pos.spot_leg.order.status in ("filled", "cancelled")
+        perp_order = pos.perp_leg.order
+        spot_order = pos.spot_leg.order
+        if not perp_order or not spot_order:
+            logger.error(
+                f"Close order missing for {pos.asset}; keeping position open for retry"
+            )
+            pos.state = ArbState.OPEN
+            pos.last_status_check = 0.0
+            return
+
+        if time.time() - pos.last_status_check >= 0.5:
+            await asyncio.gather(
+                self._orders.refresh_order(perp_order),
+                self._orders.refresh_order(spot_order),
+            )
+            pos.last_status_check = time.time()
+
+        perp_done = perp_order.status in ("filled", "cancelled")
+        spot_done = spot_order.status in ("filled", "cancelled")
 
         if perp_done and spot_done:
             logger.info(f"Position closed for {pos.asset}")
@@ -297,6 +417,17 @@ class PerpSpotArbStrategy:
         elif pos.age_secs > config.ORDER_TIMEOUT_SECS:
             logger.warning(f"Close timeout for {pos.asset} — retrying with market orders")
             pos.state = ArbState.OPEN   # will re-trigger close on next tick
+
+    @staticmethod
+    def _marketable_price(book: BookSnapshot, side: Side) -> float:
+        """Create a valid IOC limit price that crosses the current book."""
+        reference = book.ask_price if side == Side.BUY else book.bid_price
+        slippage = config.SLIPPAGE_TOLERANCE_BPS / 10_000
+        price = reference * (1 + slippage if side == Side.BUY else 1 - slippage)
+        if price <= 0:
+            return 0.0
+        digits = max(0, 5 - int(math.floor(math.log10(price))) - 1)
+        return round(price, digits)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

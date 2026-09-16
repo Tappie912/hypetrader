@@ -27,14 +27,14 @@ if not WALLET_ADDRESS or not PRIVATE_KEY:
     raise RuntimeError("HYPE_WALLET and API_KEY must be set in .env")
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
-MAX_POSITION_USD        = 1000        # max notional per position in USD
-MAX_TOTAL_EXPOSURE_USD  = 5000        # max total open notional across all positions
-MAX_ORDER_USD           = 500         # max single order size
-MAX_DAILY_LOSS_USD      = 100         # halt trading if daily PnL drops below this
+MAX_POSITION_USD        = 600        # max notional per position in USD
+MAX_TOTAL_EXPOSURE_USD  = 600        # max total open notional across all positions
+MAX_ORDER_USD           = 250         # max single order size
+MAX_DAILY_LOSS_USD      = 50         # halt trading if daily PnL drops below this
 MAX_DRAWDOWN_PCT        = 0.1          # 5% max drawdown before halt
 
 # ── Arbitrage parameters ──────────────────────────────────────────────────────
-MIN_SPREAD_BPS          = 5             # minimum spread in basis points to enter
+MIN_SPREAD_BPS          = 7             # minimum spread in basis points to enter
 CLOSE_SPREAD_BPS        = 1             # spread at which to close the arb
 SLIPPAGE_TOLERANCE_BPS  = 1            # max acceptable slippage
 ALLOW_SPOT_SELL         = False       # spot sells require the asset in the account

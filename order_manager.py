@@ -22,7 +22,7 @@ import msgpack
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_hex
-from hyperliquid.utils.signing import sign_l1_action
+from hyperliquid.utils.signing import float_to_wire, sign_l1_action
 
 from logger import logger, alert
 import config
@@ -125,15 +125,21 @@ class OrderManager:
         size: float,
         market: str = "perp",
         reduce_only: bool = False,
+        price: Optional[float] = None,
         client_id: Optional[str] = None,
     ) -> Optional[Order]:
         cid = client_id or self._gen_cid(asset, side)
         order = Order(
             client_id=cid, asset=asset, market=market,
-            side=side, size=size, price=0.0,
+            side=side, size=size, price=price or 0.0,
             order_type=OrderType.MARKET, tif=TIF.IOC,
             reduce_only=reduce_only,
         )
+        if price is None or price <= 0:
+            order.status = "error"
+            self._orders[order.client_id] = order
+            logger.error(f"Market order requires a valid aggressive price: {asset} {side.name}")
+            return order
         return await self._submit(order)
 
     async def cancel(self, order: Order) -> bool:
@@ -220,6 +226,40 @@ class OrderManager:
         resp = await self._info_post({"type": "openOrders", "user": config.WALLET_ADDRESS})
         return resp or []
 
+    async def refresh_order(self, order: Optional[Order]) -> Optional[Order]:
+        """Refresh a submitted order from Hyperliquid's authoritative status."""
+        if order is None:
+            return None
+        if not order.hl_oid or order.status in ("filled", "cancelled", "error"):
+            return order
+
+        resp = await self._info_post({
+            "type": "orderStatus",
+            "user": config.WALLET_ADDRESS,
+            "oid": order.hl_oid,
+        })
+        status_order = resp.get("order") if isinstance(resp, dict) else None
+        if not isinstance(status_order, dict):
+            return order
+
+        exchange_status = status_order.get("status", "").lower()
+        original_size = float(status_order.get("origSz", order.size))
+        remaining_size = float(status_order.get("sz", original_size))
+        order.filled = max(0.0, original_size - remaining_size)
+
+        if exchange_status == "filled":
+            order.filled = original_size
+            order.status = "filled"
+        elif exchange_status in ("resting", "open"):
+            order.status = "open"
+        elif exchange_status in ("canceled", "cancelled"):
+            order.status = "cancelled"
+        elif exchange_status:
+            order.status = "error"
+
+        self._orders[order.client_id] = order
+        return order
+
     async def get_account_value(self) -> float:
         resp = await self._info_post({"type": "clearinghouseState", "user": config.WALLET_ADDRESS})
         if not resp:
@@ -290,17 +330,25 @@ class OrderManager:
                 logger.error(f"Order status has unexpected shape: {st!r}")
             elif "resting" in st:
                 order.hl_oid = st["resting"]["oid"]
-                order.status = "open"
-                logger.info(f"Order placed: {order.client_id} | {order.side.name} {order.size} {order.asset} @ {order.price} | oid={order.hl_oid}")
-                if config.ALERT_ON_FILL:
-                    await alert(f"✅ Order open: {order.side.name} {order.size} {order.asset} @ {order.price}")
+                if order.tif == TIF.IOC:
+                    logger.warning(
+                        f"IOC order returned resting; cancelling {order.client_id} "
+                        f"(oid={order.hl_oid})"
+                    )
+                    await self.cancel(order)
+                else:
+                    order.status = "open"
+                    logger.info(f"Order placed: {order.client_id} | {order.side.name} {order.size} {order.asset} @ {order.price} | oid={order.hl_oid}")
+                    if config.ALERT_ON_FILL:
+                        await alert(f"✅ Order open: {order.side.name} {order.size} {order.asset} @ {order.price}")
             elif "filled" in st:
                 order.status = "filled"
-                order.filled = order.size
-                fill_px = st["filled"].get("avgPx", order.price)
-                logger.info(f"Order filled immediately: {order.client_id} @ avg {fill_px}")
+                fill = st["filled"]
+                order.filled = float(fill.get("totalSz", fill.get("filledSz", order.size)))
+                fill_px = fill.get("avgPx", order.price)
+                logger.info(f"Order filled immediately: {order.client_id} | size={order.filled} @ avg {fill_px}")
                 if config.ALERT_ON_FILL:
-                    await alert(f"🎯 Order filled: {order.side.name} {order.size} {order.asset} @ {fill_px}")
+                    await alert(f"🎯 Order filled: {order.side.name} {order.filled} {order.asset} @ {fill_px}")
             elif "error" in st:
                 order.status = "error"
                 logger.error(f"Order error: {st['error']}")
@@ -322,19 +370,14 @@ class OrderManager:
         )
         is_buy = side == Side.BUY
 
-        if price == 0.0:
-            # Market order: use a very aggressive limit price
-            order_type = {"limit": {"tif": "Ioc"}}
-            limit_px = "0"   # will be treated as market
-        else:
-            order_type = {"limit": {"tif": tif.value}}
-            limit_px = str(price)
+        order_type = {"limit": {"tif": tif.value}}
+        limit_px = str(price)
 
         return {
             "a": asset_idx,
             "b": is_buy,
-            "p": limit_px,
-            "s": str(size),
+            "p": float_to_wire(price),
+            "s": float_to_wire(size),
             "r": reduce_only,
             "t": order_type,
         }
@@ -342,7 +385,15 @@ class OrderManager:
     async def _signed_post(self, action: dict) -> Optional[dict]:
         """Sign and submit an action to /exchange."""
         nonce = int(time.time() * 1000)
-        payload = {"action": action, "nonce": nonce, "signature": self._sign(action, nonce)}
+        # Keep the signed request shape aligned with the official SDK. The
+        # exchange includes these fields when reconstructing the L1 signature.
+        payload = {
+            "action": action,
+            "nonce": nonce,
+            "signature": self._sign(action, nonce),
+            "vaultAddress": None,
+            "expiresAfter": None,
+        }
         return await self._post(f"{config.HYPERLIQUID_API_URL}/exchange", payload)
 
     async def _info_post(self, body: dict) -> Optional[dict]:
@@ -373,7 +424,7 @@ class OrderManager:
             None,
             nonce,
             None,
-            True,
+            config.HYPERLIQUID_API_URL.rstrip("/") == "https://api.hyperliquid.xyz",
         )
 
     def _hash_action(self, action: dict, nonce: int, connection_id: bytes) -> bytes:
