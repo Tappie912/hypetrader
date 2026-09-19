@@ -146,7 +146,11 @@ class OrderManager:
         if not order.hl_oid:
             logger.warning(f"Cannot cancel {order.client_id}: no HL order ID")
             return False
-        asset_idx = self._asset_index.get(order.asset)
+        asset_idx = (
+            config.SPOT_ASSET_INDICES.get(order.asset)
+            if order.market == "spot"
+            else self._asset_index.get(order.asset)
+        )
         if asset_idx is None:
             logger.error(f"Unknown asset: {order.asset}")
             return False
@@ -338,17 +342,17 @@ class OrderManager:
                     await self.cancel(order)
                 else:
                     order.status = "open"
-                    logger.info(f"Order placed: {order.client_id} | {order.side.name} {order.size} {order.asset} @ {order.price} | oid={order.hl_oid}")
+                    logger.info(f"Order placed: {order.client_id} | {order.market} {order.side.name} {order.size} {order.asset} @ {order.price} | oid={order.hl_oid}")
                     if config.ALERT_ON_FILL:
-                        await alert(f"✅ Order open: {order.side.name} {order.size} {order.asset} @ {order.price}")
+                        await alert(f"✅ Order open: {order.market} {order.side.name} {order.size} {order.asset} @ {order.price}")
             elif "filled" in st:
                 order.status = "filled"
                 fill = st["filled"]
                 order.filled = float(fill.get("totalSz", fill.get("filledSz", order.size)))
                 fill_px = fill.get("avgPx", order.price)
-                logger.info(f"Order filled immediately: {order.client_id} | size={order.filled} @ avg {fill_px}")
+                logger.info(f"Order filled immediately: {order.client_id} | market={order.market} size={order.filled} @ avg {fill_px}")
                 if config.ALERT_ON_FILL:
-                    await alert(f"🎯 Order filled: {order.side.name} {order.filled} {order.asset} @ {fill_px}")
+                    await alert(f"🎯 Order filled: {order.market} {order.side.name} {order.filled} {order.asset} @ {fill_px}")
             elif "error" in st:
                 order.status = "error"
                 logger.error(f"Order error: {st['error']}")

@@ -42,6 +42,7 @@ class ArbState(str, Enum):
 @dataclass
 class ArbLeg:
     order: Optional[Order] = None
+    close_order: Optional[Order] = None
     filled: bool = False
 
 
@@ -354,6 +355,9 @@ class PerpSpotArbStrategy:
         logger.info(f"Closing arb on {pos.asset}: spread={spread_bps:.1f}bps (entry={pos.entry_spread_bps:.1f}bps)")
         await alert(f"📉 Closing arb: {pos.asset} | spread={spread_bps:.1f}bps compressed")
 
+        # Keep the entry orders as the source of truth for the exposure being
+        # closed. Close orders are tracked separately so a retry cannot reverse
+        # an earlier close attempt.
         perp_order = pos.perp_leg.order
         spot_order = pos.spot_leg.order
 
@@ -361,34 +365,50 @@ class PerpSpotArbStrategy:
             pos.state = ArbState.FLAT
             return
 
-        # Close each leg in opposite direction, reduce-only
+        # Close each leg in opposite direction, reduce-only. A previously
+        # filled leg must not be submitted again after the other leg times out.
         close_perp_side = Side.BUY  if perp_order.side == Side.SELL else Side.SELL
         close_spot_side = Side.BUY  if spot_order.side == Side.SELL else Side.SELL
         close_perp_price = self._marketable_price(perp_book, close_perp_side)
         close_spot_price = self._marketable_price(spot_book, close_spot_side)
 
+        async def close_if_needed(
+            leg: ArbLeg,
+            side: Side,
+            size: float,
+            market: str,
+            price: float,
+        ) -> Optional[Order]:
+            if leg.close_order and leg.close_order.status == "filled":
+                return leg.close_order
+            return await self._orders.place_market(
+                pos.asset,
+                side,
+                size,
+                market=market,
+                reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
+                price=price,
+            )
+
         close_perp, close_spot = await asyncio.gather(
-            self._orders.place_market(
-                pos.asset, close_perp_side, perp_order.filled or perp_order.size,
-                market="perp", reduce_only=config.REDUCE_ONLY_ON_CLOSE,
-                price=close_perp_price,
-            ),
-            self._orders.place_market(
-                pos.asset, close_spot_side, spot_order.filled or spot_order.size,
-                market="spot", reduce_only=False,
-                price=close_spot_price,
-            ),
+            close_if_needed(pos.perp_leg, close_perp_side, perp_order.filled or perp_order.size, "perp", close_perp_price),
+            close_if_needed(pos.spot_leg, close_spot_side, spot_order.filled or spot_order.size, "spot", close_spot_price),
         )
 
-        pos.perp_leg = ArbLeg(order=close_perp)
-        pos.spot_leg = ArbLeg(order=close_spot)
+        if not close_perp or close_perp.status in ("error", "cancelled"):
+            logger.error(f"Perp close failed for {pos.asset}: {close_perp.status if close_perp else 'no order'}")
+        if not close_spot or close_spot.status in ("error", "cancelled"):
+            logger.error(f"Spot close failed for {pos.asset}: {close_spot.status if close_spot else 'no order'}")
+
+        pos.perp_leg.close_order = close_perp
+        pos.spot_leg.close_order = close_spot
         pos.entry_time = time.time()
         pos.last_status_check = 0.0
         pos.state = ArbState.CLOSING
 
     async def _check_close_fills(self, pos: ArbPosition) -> None:
-        perp_order = pos.perp_leg.order
-        spot_order = pos.spot_leg.order
+        perp_order = pos.perp_leg.close_order
+        spot_order = pos.spot_leg.close_order
         if not perp_order or not spot_order:
             logger.error(
                 f"Close order missing for {pos.asset}; keeping position open for retry"
@@ -404,8 +424,8 @@ class PerpSpotArbStrategy:
             )
             pos.last_status_check = time.time()
 
-        perp_done = perp_order.status in ("filled", "cancelled")
-        spot_done = spot_order.status in ("filled", "cancelled")
+        perp_done = perp_order.status == "filled"
+        spot_done = spot_order.status == "filled"
 
         if perp_done and spot_done:
             logger.info(f"Position closed for {pos.asset}")
@@ -416,7 +436,7 @@ class PerpSpotArbStrategy:
 
         elif pos.age_secs > config.ORDER_TIMEOUT_SECS:
             logger.warning(f"Close timeout for {pos.asset} — retrying with market orders")
-            pos.state = ArbState.OPEN   # will re-trigger close on next tick
+            pos.state = ArbState.OPEN
 
     @staticmethod
     def _marketable_price(book: BookSnapshot, side: Side) -> float:

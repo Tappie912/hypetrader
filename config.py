@@ -31,10 +31,11 @@ MAX_POSITION_USD        = 600        # max notional per position in USD
 MAX_TOTAL_EXPOSURE_USD  = 600        # max total open notional across all positions
 MAX_ORDER_USD           = 250         # max single order size
 MAX_DAILY_LOSS_USD      = 50         # halt trading if daily PnL drops below this
-MAX_DRAWDOWN_PCT        = 0.1          # 5% max drawdown before halt
+MAX_DRAWDOWN_PCT        = 0.1          # 10% max drawdown before halt
 
 # ── Arbitrage parameters ──────────────────────────────────────────────────────
-MIN_SPREAD_BPS          = 7             # minimum spread in basis points to enter
+# fees are 6.72 bps for spot and 4.32 bps for perp, so the minimum spread to enter should be 2x 11.04 bps
+MIN_SPREAD_BPS          = 23             # minimum spread in basis points to enter
 CLOSE_SPREAD_BPS        = 1             # spread at which to close the arb
 SLIPPAGE_TOLERANCE_BPS  = 1            # max acceptable slippage
 ALLOW_SPOT_SELL         = False       # spot sells require the asset in the account
