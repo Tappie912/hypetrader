@@ -109,6 +109,79 @@ class PerpSpotArbStrategy:
         self._running = False
         logger.info("PerpSpotArbStrategy stopping")
 
+    def positions_snapshot(self) -> List[dict]:
+        """Return both legs tracked by the strategy for dashboard telemetry."""
+        snapshots = []
+        for pos in self._positions.values():
+            if pos.state == ArbState.FLAT:
+                continue
+            spot_asset = next(
+                (spot for perp, spot in config.ARB_PAIRS if perp == pos.asset),
+                pos.asset,
+            )
+
+            def leg_snapshot(leg: ArbLeg, market: str, asset: str) -> dict:
+                order = leg.order
+                close_order = leg.close_order
+                return {
+                    "asset": asset,
+                    "market": market,
+                    "side": order.side.name if order else None,
+                    "size": (order.filled or order.size) if order else 0.0,
+                    "price": order.price if order else 0.0,
+                    "status": order.status if order else "missing",
+                    "close_status": close_order.status if close_order else "not started",
+                }
+
+            snapshots.append({
+                "asset": pos.asset,
+                "state": pos.state.value,
+                "entry_spread_bps": pos.entry_spread_bps,
+                "legs": [
+                    leg_snapshot(pos.perp_leg, "perp", pos.asset),
+                    leg_snapshot(pos.spot_leg, "spot", spot_asset),
+                ],
+            })
+        return snapshots
+
+    async def close_all_positions(self) -> List[str]:
+        """Force-close every tracked non-flat arb at current book prices."""
+        closed = []
+        for pos in self._positions.values():
+            if pos.state == ArbState.FLAT:
+                continue
+            perp_order = pos.perp_leg.order
+            spot_order = pos.spot_leg.order
+            if not perp_order or not spot_order:
+                logger.error(f"Cannot force-close incomplete {pos.asset} position")
+                continue
+
+            perp_book = self._feed.get_book(pos.asset, "perp")
+            spot_asset = next((spot for perp, spot in config.ARB_PAIRS if perp == pos.asset), pos.asset)
+            spot_book = self._feed.get_book(spot_asset, "spot")
+            if not perp_book or not spot_book or perp_book.is_stale() or spot_book.is_stale():
+                logger.error(f"Cannot force-close {pos.asset}: live books unavailable")
+                continue
+
+            perp_side = Side.BUY if perp_order.side == Side.SELL else Side.SELL
+            spot_side = Side.BUY if spot_order.side == Side.SELL else Side.SELL
+            perp_close, spot_close = await asyncio.gather(
+                self._orders.place_market(
+                    pos.asset, perp_side, perp_order.filled or perp_order.size,
+                    market="perp", reduce_only=config.REDUCE_ONLY_ON_CLOSE,
+                    price=self._marketable_price(perp_book, perp_side),
+                ),
+                self._orders.place_market(
+                    pos.asset, spot_side, spot_order.filled or spot_order.size,
+                    market="spot", price=self._marketable_price(spot_book, spot_side),
+                ),
+            )
+            pos.perp_leg.close_order = perp_close
+            pos.spot_leg.close_order = spot_close
+            pos.state = ArbState.CLOSING
+            closed.append(pos.asset)
+        return closed
+
     # ── Per-tick logic ────────────────────────────────────────────────────────
 
     async def _tick(self) -> None:
@@ -149,7 +222,7 @@ class PerpSpotArbStrategy:
                     self._last_book_diagnostic[diagnostic_key] = time.time()
                 continue
 
-            spread_bps = self._feed.get_spread_bps(perp_asset)
+            spread_bps = self._feed.get_spread_bps(perp_asset, spot_asset)
             if spread_bps is None:
                 continue
 
@@ -259,7 +332,8 @@ class PerpSpotArbStrategy:
             if not order or order.filled <= 0:
                 unwind_orders.append(None)
                 continue
-            book = self._feed.get_book(pos.asset, market)
+            spot_asset = next((spot for perp, spot in config.ARB_PAIRS if perp == pos.asset), pos.asset)
+            book = self._feed.get_book(pos.asset if market == "perp" else spot_asset, market)
             if not book:
                 logger.critical(f"Cannot unwind filled {pos.asset} {market}: no book")
                 unwind_orders.append(None)
@@ -312,8 +386,25 @@ class PerpSpotArbStrategy:
         pos.spot_leg.filled = spot_filled
 
         if perp_filled and spot_filled:
+            perp_size = pos.perp_leg.order.filled
+            spot_size = pos.spot_leg.order.filled
+            tolerance = 10 ** -config.SIZE_DECIMALS.get(pos.asset, 4)
+            if abs(perp_size - spot_size) > tolerance:
+                logger.error(
+                    f"Unequal fills for {pos.asset}: "
+                    f"perp={perp_size} spot={spot_size}; unwinding both legs"
+                )
+                await self._unwind_entry_fills(
+                    pos,
+                    pos.perp_leg.order,
+                    pos.spot_leg.order,
+                )
+                return
             pos.state = ArbState.OPEN
-            logger.info(f"Both legs filled for {pos.asset} — position open")
+            logger.info(
+                f"Both legs filled for {pos.asset} — position open "
+                f"(perp={perp_size}, spot={spot_size})"
+            )
             return
 
         # Timeout: cancel unfilled leg to avoid one-legged risk
@@ -335,7 +426,8 @@ class PerpSpotArbStrategy:
                 if not order or order.filled <= 0:
                     unwind_orders.append(None)
                     continue
-                book = self._feed.get_book(pos.asset, market)
+                spot_asset = next((spot for perp, spot in config.ARB_PAIRS if perp == pos.asset), pos.asset)
+                book = self._feed.get_book(pos.asset if market == "perp" else spot_asset, market)
                 if not book:
                     logger.error(f"Cannot unwind partial {pos.asset} {market}: no book")
                     unwind_orders.append(None)

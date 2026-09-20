@@ -65,10 +65,10 @@ class MarketDataFeed:
     def get_book(self, asset: str, market: str = "perp") -> Optional[BookSnapshot]:
         return self._books.get((asset, market))
 
-    def get_spread_bps(self, asset: str) -> Optional[float]:
+    def get_spread_bps(self, asset: str, spot_asset: Optional[str] = None) -> Optional[float]:
         """Return basis-point spread between perp ask and spot bid (or None)."""
         perp = self._books.get((asset, "perp"))
-        spot = self._books.get((asset, "spot"))
+        spot = self._books.get((spot_asset or asset, "spot"))
         if not perp or not spot:
             return None
         if perp.is_stale() or spot.is_stale():

@@ -82,6 +82,21 @@ python main.py
 python main.py --close-on-exit
 ```
 
+### Local dashboard
+
+The bot also serves a local control dashboard at `http://127.0.0.1:8080`.
+It provides start/stop controls, account and position telemetry, configured
+risk parameters, live perp/spot spreads, and an emergency close action.
+
+Optional notification sounds can be placed at:
+
+```text
+hypetrader/dashboard_assets/coin.mp3
+hypetrader/dashboard_assets/error.mp3
+```
+
+The dashboard never exposes the API key to the browser.
+
 ---
 
 ## Strategy: Perp-Spot Arbitrage

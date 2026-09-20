@@ -80,6 +80,7 @@ class OrderManager:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._account = Account.from_key(config.PRIVATE_KEY)
+        self._last_account_value = 0.0
         self._orders: Dict[str, Order] = {}   # client_id -> Order
         self._asset_index: Dict[str, int] = {}  # populated on first meta fetch
 
@@ -145,7 +146,7 @@ class OrderManager:
             logger.warning(f"Cannot cancel {order.client_id}: no HL order ID")
             return False
         asset_idx = (
-            config.SPOT_ASSET_INDICES.get(order.asset)
+            config.SPOT_ASSET_INDICES.get(self._spot_asset(order.asset))
             if order.market == "spot"
             else self._asset_index.get(order.asset)
         )
@@ -262,9 +263,8 @@ class OrderManager:
         self._orders[order.client_id] = order
         return order
 
-    async def get_account_value(self) -> float:
-        # Unified accounts can hold USDC in spot while the perp margin
-        # summary is still zero. Report the larger of the two balances.
+    async def get_account_value(self, spot_prices: Optional[Dict[str, float]] = None) -> float:
+        # Mark spot assets to market so buying spot does not look like a loss.
         perp = await self._info_post({
             "type": "clearinghouseState",
             "user": config.ACCOUNT_ADDRESS,
@@ -276,17 +276,31 @@ class OrderManager:
 
         perp_value = float((perp or {}).get("marginSummary", {}).get("accountValue", 0))
         spot_value = 0.0
+        unpriced_assets = False
         for balance in (spot or {}).get("balances", []):
-            if balance.get("coin") == "USDC":
-                spot_value = float(balance.get("total", 0))
-                break
-        return max(perp_value, spot_value)
+            coin = balance.get("coin")
+            total = float(balance.get("total", 0))
+            if coin == "USDC":
+                spot_value += total
+            elif spot_prices and coin in spot_prices:
+                spot_value += total * spot_prices[coin]
+            elif total:
+                unpriced_assets = True
+
+        if unpriced_assets and self._last_account_value > 0:
+            return self._last_account_value
+
+        # The perp summary and spot state are separate on this account. Using
+        # the larger marked value avoids counting the same collateral twice.
+        value = max(perp_value, spot_value)
+        self._last_account_value = value
+        return value
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _submit(self, order: Order) -> Optional[Order]:
         asset_idx = (
-            config.SPOT_ASSET_INDICES.get(order.asset)
+            config.SPOT_ASSET_INDICES.get(self._spot_asset(order.asset))
             if order.market == "spot"
             else self._asset_index.get(order.asset)
         )
@@ -380,7 +394,7 @@ class OrderManager:
         tif: TIF, reduce_only: bool, market: str = "perp",
     ) -> dict:
         asset_idx = (
-            config.SPOT_ASSET_INDICES.get(asset, 0)
+            config.SPOT_ASSET_INDICES.get(self._spot_asset(asset), 0)
             if market == "spot"
             else self._asset_index.get(asset, 0)
         )
@@ -459,6 +473,13 @@ class OrderManager:
         for i, asset in enumerate(resp.get("universe", [])):
             self._asset_index[asset["name"]] = i
         logger.info(f"Loaded {len(self._asset_index)} asset indices")
+
+    @staticmethod
+    def _spot_asset(perp_asset: str) -> str:
+        for perp, spot in config.ARB_PAIRS:
+            if perp == perp_asset:
+                return spot
+        return perp_asset
 
     @staticmethod
     def _gen_cid(asset: str, side: Side) -> str:
