@@ -5,8 +5,10 @@ Edit this file before running. Never commit private keys.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 # ── Node / API endpoints ──────────────────────────────────────────────────────
 # Point these at your own node if you have one running, otherwise use public.
@@ -18,13 +20,21 @@ HYPERLIQUID_EVM_RPC   = "https://rpc.hyperliquid.xyz/evm"  # HyperEVM JSON-RPC
 #   HYPERLIQUID_API_URL = "http://<your-node-ip>:3000"
 #   HYPERLIQUID_WS_URL  = "ws://<your-node-ip>:3000/ws"
 
-# ── Wallet ────────────────────────────────────────────────────────────────────
-# Use an API sub-wallet (generate on app.hyperliquid.xyz/API), not your main wallet.
-WALLET_ADDRESS = os.getenv("HYPE_WALLET_ADDRESS") or os.getenv("HYPE_WALLET")
+# ── Account / signing wallet ─────────────────────────────────────────────────
+# ACCOUNT_ADDRESS is the funded Hyperliquid account queried for balances,
+# positions, and orders. PRIVATE_KEY is the key used to sign requests.
+ACCOUNT_ADDRESS = (
+    os.getenv("HYPE_ACCOUNT_ADDRESS")
+    or os.getenv("HYPE_WALLET_ADDRESS")
+    or os.getenv("HYPE_WALLET")
+)
+WALLET_ADDRESS = ACCOUNT_ADDRESS  # compatibility with existing modules
 PRIVATE_KEY = os.getenv("API_KEY")  # keep secret — use env vars in prod
 
-if not WALLET_ADDRESS or not PRIVATE_KEY:
-    raise RuntimeError("HYPE_WALLET and API_KEY must be set in .env")
+if not ACCOUNT_ADDRESS or not PRIVATE_KEY:
+    raise RuntimeError(
+        "HYPE_ACCOUNT_ADDRESS (or HYPE_WALLET_ADDRESS) and API_KEY must be set in .env"
+    )
 
 # ── Risk limits ───────────────────────────────────────────────────────────────
 MAX_POSITION_USD        = 600        # max notional per position in USD
@@ -47,6 +57,7 @@ ARB_PAIRS = [
     ("BTC", "BTC"),   # BTC perp vs BTC spot
     ("SOL", "SOL"),   # SOL perp vs SOL spot
     ("HYPE", "HYPE"), # HYPE perp vs HYPE spot
+    ("ZEC", "UZEC"),  # ZEC perp vs Unit Zcash spot
 ]
 
 # Hyperliquid spot market identifiers for the wrapped assets above.
@@ -55,6 +66,7 @@ SPOT_COINS = {
     "BTC": "@142",
     "SOL": "@156",
     "HYPE": "@107",
+    "UZEC": "@272",
 }
 
 # Spot order asset indices are 10000 plus the spotMeta universe index.
@@ -63,6 +75,7 @@ SPOT_ASSET_INDICES = {
     "BTC": 10_142,
     "SOL": 10_156,
     "HYPE": 10_107,
+    "UZEC": 10_272,
 }
 
 # Shared perp/spot size precision uses the stricter precision of each pair.
@@ -71,6 +84,7 @@ SIZE_DECIMALS = {
     "BTC": 5,
     "SOL": 2,
     "HYPE": 2,
+    "ZEC": 2,
 }
 
 # ── Order management ──────────────────────────────────────────────────────────

@@ -84,6 +84,7 @@ class PerpSpotArbStrategy:
         }
         self._running = False
         self._last_pnl_alert = time.time()
+        self._last_book_diagnostic: Dict[str, float] = {}
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -123,9 +124,29 @@ class PerpSpotArbStrategy:
             spot_book  = self._feed.get_book(spot_asset,  "spot")
 
             if not perp_book or not spot_book:
+                diagnostic_key = f"missing:{perp_asset}"
+                if time.time() - self._last_book_diagnostic.get(diagnostic_key, 0) >= 10:
+                    missing = []
+                    if not perp_book:
+                        missing.append(f"perp:{perp_asset}")
+                    if not spot_book:
+                        missing.append(f"spot:{spot_asset}")
+                    logger.debug(f"Book unavailable for {perp_asset}: {', '.join(missing)}")
+                    self._last_book_diagnostic[diagnostic_key] = time.time()
                 continue
             if perp_book.is_stale() or spot_book.is_stale():
-                logger.debug(f"Stale book data for {perp_asset}, skipping")
+                diagnostic_key = f"stale:{perp_asset}"
+                if time.time() - self._last_book_diagnostic.get(diagnostic_key, 0) >= 10:
+                    perp_age = time.time() - perp_book.ts
+                    spot_age = time.time() - spot_book.ts
+                    logger.debug(
+                        f"Stale book data for {perp_asset}, skipping | "
+                        f"perp={perp_book.asset}/{perp_book.market} mid={perp_book.mid:.8g} "
+                        f"age={perp_age:.2f}s | "
+                        f"spot={spot_book.asset}/{spot_book.market} mid={spot_book.mid:.8g} "
+                        f"age={spot_age:.2f}s"
+                    )
+                    self._last_book_diagnostic[diagnostic_key] = time.time()
                 continue
 
             spread_bps = self._feed.get_spread_bps(perp_asset)

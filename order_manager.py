@@ -80,8 +80,6 @@ class OrderManager:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._account = Account.from_key(config.PRIVATE_KEY)
-        if self._account.address.lower() != config.WALLET_ADDRESS.lower():
-            raise RuntimeError("WALLET_ADDRESS does not match the address derived from API_KEY")
         self._orders: Dict[str, Order] = {}   # client_id -> Order
         self._asset_index: Dict[str, int] = {}  # populated on first meta fetch
 
@@ -206,7 +204,7 @@ class OrderManager:
 
     async def get_positions(self) -> List[Position]:
         """Fetch all open perpetual positions."""
-        resp = await self._info_post({"type": "clearinghouseState", "user": config.WALLET_ADDRESS})
+        resp = await self._info_post({"type": "clearinghouseState", "user": config.ACCOUNT_ADDRESS})
         positions = []
         if not resp:
             return positions
@@ -227,7 +225,7 @@ class OrderManager:
         return positions
 
     async def get_open_orders(self) -> List[dict]:
-        resp = await self._info_post({"type": "openOrders", "user": config.WALLET_ADDRESS})
+        resp = await self._info_post({"type": "openOrders", "user": config.ACCOUNT_ADDRESS})
         return resp or []
 
     async def refresh_order(self, order: Optional[Order]) -> Optional[Order]:
@@ -239,7 +237,7 @@ class OrderManager:
 
         resp = await self._info_post({
             "type": "orderStatus",
-            "user": config.WALLET_ADDRESS,
+            "user": config.ACCOUNT_ADDRESS,
             "oid": order.hl_oid,
         })
         status_order = resp.get("order") if isinstance(resp, dict) else None
@@ -265,10 +263,24 @@ class OrderManager:
         return order
 
     async def get_account_value(self) -> float:
-        resp = await self._info_post({"type": "clearinghouseState", "user": config.WALLET_ADDRESS})
-        if not resp:
-            return 0.0
-        return float(resp.get("marginSummary", {}).get("accountValue", 0))
+        # Unified accounts can hold USDC in spot while the perp margin
+        # summary is still zero. Report the larger of the two balances.
+        perp = await self._info_post({
+            "type": "clearinghouseState",
+            "user": config.ACCOUNT_ADDRESS,
+        })
+        spot = await self._info_post({
+            "type": "spotClearinghouseState",
+            "user": config.ACCOUNT_ADDRESS,
+        })
+
+        perp_value = float((perp or {}).get("marginSummary", {}).get("accountValue", 0))
+        spot_value = 0.0
+        for balance in (spot or {}).get("balances", []):
+            if balance.get("coin") == "USDC":
+                spot_value = float(balance.get("total", 0))
+                break
+        return max(perp_value, spot_value)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

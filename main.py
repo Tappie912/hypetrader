@@ -30,7 +30,7 @@ import config
 async def main(close_on_exit: bool = False) -> None:
     logger.info("=" * 60)
     logger.info("  Hyperliquid Arb Bot starting")
-    logger.info(f"  Wallet  : {config.WALLET_ADDRESS}")
+    logger.info(f"  Account : {config.ACCOUNT_ADDRESS}")
     logger.info(f"  API URL : {config.HYPERLIQUID_API_URL}")
     logger.info(f"  Pairs   : {config.ARB_PAIRS}")
     logger.info("=" * 60)

@@ -82,7 +82,7 @@ class MarketDataFeed:
     async def subscribe_perp(self, asset: str) -> None:
         sub = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": asset}}
         self._subscriptions.append((sub, asset, "perp"))
-        if self._ws:
+        if self._ws is not None:
             await self._ws.send(json.dumps(sub))
             logger.debug(f"Subscribed perp l2Book: {asset}")
 
@@ -90,7 +90,7 @@ class MarketDataFeed:
         coin = config.SPOT_COINS.get(asset, asset)
         sub = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}
         self._subscriptions.append((sub, asset, "spot"))
-        if self._ws:
+        if self._ws is not None:
             await self._ws.send(json.dumps(sub))
             logger.debug(f"Subscribed spot l2Book: {asset}")
 

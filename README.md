@@ -33,26 +33,15 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-Edit `config.py`:
+Create `hypetrader/.env`:
 
-```python
-WALLET_ADDRESS = "0xYOUR_WALLET_ADDRESS"
-PRIVATE_KEY    = "0xYOUR_PRIVATE_KEY"
+```dotenv
+HYPE_ACCOUNT_ADDRESS="0xYOUR_FUNDED_ACCOUNT_ADDRESS"
+API_KEY="0xYOUR_API_AGENT_PRIVATE_KEY"
 ```
 
-**Security tip:** use environment variables instead of hardcoding keys:
-
-```bash
-export HL_WALLET_ADDRESS="0x..."
-export HL_PRIVATE_KEY="0x..."
-```
-
-Then in `config.py`:
-```python
-import os
-WALLET_ADDRESS = os.environ["HL_WALLET_ADDRESS"]
-PRIVATE_KEY    = os.environ["HL_PRIVATE_KEY"]
-```
+`HYPE_ACCOUNT_ADDRESS` is the funded account queried by the bot. `API_KEY` is
+the signing key. Keep the API key private and never commit `.env`.
 
 Generate a dedicated API sub-wallet on https://app.hyperliquid.xyz/API — never use your main wallet private key.
 
