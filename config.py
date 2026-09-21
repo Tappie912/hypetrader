@@ -45,7 +45,7 @@ MAX_DRAWDOWN_PCT        = 0.1          # 10% max drawdown before halt
 
 # ── Arbitrage parameters ──────────────────────────────────────────────────────
 # fees are 6.72 bps for spot and 4.32 bps for perp, so the minimum spread to enter should be 2x 11.04 bps
-MIN_SPREAD_BPS          = 9             # minimum spread in basis points to enter
+MIN_SPREAD_BPS          = 22             # minimum spread in basis points to enter
 CLOSE_SPREAD_BPS        = 1             # spread at which to close the arb
 SLIPPAGE_TOLERANCE_BPS  = 1            # max acceptable slippage
 ALLOW_SPOT_SELL         = False       # spot sells require the asset in the account

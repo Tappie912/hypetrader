@@ -74,7 +74,13 @@ class PerpSpotArbStrategy:
         await strat.run()
     """
 
-    def __init__(self, feed: MarketDataFeed, orders: OrderManager, risk: RiskManager):
+    def __init__(
+        self,
+        feed: MarketDataFeed,
+        orders: OrderManager,
+        risk: RiskManager,
+        trading_enabled: bool = False,
+    ):
         self._feed   = feed
         self._orders = orders
         self._risk   = risk
@@ -83,6 +89,7 @@ class PerpSpotArbStrategy:
             for asset, _ in config.ARB_PAIRS
         }
         self._running = False
+        self._trading_enabled = trading_enabled
         self._last_pnl_alert = time.time()
         self._last_book_diagnostic: Dict[str, float] = {}
 
@@ -108,6 +115,9 @@ class PerpSpotArbStrategy:
     def stop(self) -> None:
         self._running = False
         logger.info("PerpSpotArbStrategy stopping")
+
+    def set_trading_enabled(self, enabled: bool) -> None:
+        self._trading_enabled = enabled
 
     def positions_snapshot(self) -> List[dict]:
         """Return both legs tracked by the strategy for dashboard telemetry."""
@@ -247,6 +257,8 @@ class PerpSpotArbStrategy:
         spot: BookSnapshot,
         spread_bps: float,
     ) -> None:
+        if not self._trading_enabled:
+            return
         if abs(spread_bps) < config.MIN_SPREAD_BPS:
             return
 

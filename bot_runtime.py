@@ -18,11 +18,16 @@ class BotRuntime:
         self.strategy: Optional[PerpSpotArbStrategy] = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        self._trading_enabled = False
         self._orders_started = False
 
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def trading_enabled(self) -> bool:
+        return self._trading_enabled
 
     async def start(self) -> None:
         if self._running:
@@ -33,7 +38,9 @@ class BotRuntime:
 
         self.feed = MarketDataFeed()
         self.risk = RiskManager()
-        self.strategy = PerpSpotArbStrategy(self.feed, self.orders, self.risk)
+        self.strategy = PerpSpotArbStrategy(
+            self.feed, self.orders, self.risk, trading_enabled=self._trading_enabled
+        )
         self._running = True
         self._tasks = [
             asyncio.create_task(self.feed.run(), name="feed"),
@@ -43,10 +50,17 @@ class BotRuntime:
         ]
         logger.info("Bot runtime started")
 
+    def set_trading_enabled(self, enabled: bool) -> None:
+        self._trading_enabled = enabled
+        if self.strategy:
+            self.strategy.set_trading_enabled(enabled)
+        logger.info("Trading %s", "enabled" if enabled else "disabled")
+
     async def stop(self) -> None:
         if not self._running:
             return
         self._running = False
+        self._trading_enabled = False
         if self.strategy:
             self.strategy.stop()
         if self.feed:
