@@ -41,6 +41,20 @@ class BotRuntime:
         self.strategy = PerpSpotArbStrategy(
             self.feed, self.orders, self.risk, trading_enabled=self._trading_enabled
         )
+        try:
+            positions = await self.orders.get_positions()
+        except Exception as exc:
+            logger.error(f"Position sync failed; bot will not start: {exc}")
+            await self.orders.stop()
+            self._orders_started = False
+            self.feed = None
+            self.risk = None
+            self.strategy = None
+            return
+
+        self.strategy.adopt_positions(positions)
+        self.risk.update_positions(positions)
+        self.risk.update_account_value(await self.orders.get_account_value())
         self._running = True
         self._tasks = [
             asyncio.create_task(self.feed.run(), name="feed"),

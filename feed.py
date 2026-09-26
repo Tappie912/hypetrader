@@ -66,18 +66,21 @@ class MarketDataFeed:
         return self._books.get((asset, market))
 
     def get_spread_bps(self, asset: str, spot_asset: Optional[str] = None) -> Optional[float]:
-        """Return basis-point spread between perp ask and spot bid (or None)."""
+        """Return the executable entry spread using the appropriate touch prices."""
         perp = self._books.get((asset, "perp"))
         spot = self._books.get((spot_asset or asset, "spot"))
         if not perp or not spot:
             return None
         if perp.is_stale() or spot.is_stale():
             return None
-        # Perp premium: positive means perp trades above spot
-        mid_avg = (perp.mid + spot.mid) / 2
-        if mid_avg <= 0:
+        if perp.mid >= spot.mid:
+            perp_price, spot_price = perp.bid_price, spot.ask_price
+        else:
+            perp_price, spot_price = perp.ask_price, spot.bid_price
+        mid = (perp_price + spot_price) / 2
+        if perp_price <= 0 or spot_price <= 0 or mid <= 0:
             return None
-        return (perp.mid - spot.mid) / mid_avg * 10_000
+        return (perp_price - spot_price) / mid * 10_000
 
     async def subscribe_perp(self, asset: str) -> None:
         sub = {"method": "subscribe", "subscription": {"type": "l2Book", "coin": asset}}

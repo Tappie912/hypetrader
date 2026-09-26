@@ -13,6 +13,7 @@ Supports:
 
 import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -204,24 +205,57 @@ class OrderManager:
     # ── Position & account queries ────────────────────────────────────────────
 
     async def get_positions(self) -> List[Position]:
-        """Fetch all open perpetual positions."""
-        resp = await self._info_post({"type": "clearinghouseState", "user": config.ACCOUNT_ADDRESS})
+        """Fetch open perpetual positions and non-USDC spot balances."""
+        resp, spot_resp, mids = await asyncio.gather(
+            self._info_post({"type": "clearinghouseState", "user": config.ACCOUNT_ADDRESS}),
+            self._info_post({"type": "spotClearinghouseState", "user": config.ACCOUNT_ADDRESS}),
+            self._info_post({"type": "allMids"}),
+        )
+        if not isinstance(resp, dict) or not isinstance(spot_resp, dict):
+            raise RuntimeError("Could not fetch both perpetual and spot account positions")
+        if not isinstance(mids, dict):
+            mids = {}
+
         positions = []
-        if not resp:
-            return positions
         for p in resp.get("assetPositions", []):
             pos = p.get("position", {})
             size = float(pos.get("szi", 0))
             if size == 0:
+                continue
+            entry_price = float(pos.get("entryPx", 0))
+            position_value = abs(float(pos.get("positionValue", size * entry_price)))
+            if position_value < config.MIN_POSITION_NOTIONAL_USD:
                 continue
             positions.append(Position(
                 asset=pos["coin"],
                 market="perp",
                 side=Side.BUY if size > 0 else Side.SELL,
                 size=abs(size),
-                entry_price=float(pos.get("entryPx", 0)),
+                entry_price=entry_price,
                 unrealized_pnl=float(pos.get("unrealizedPnl", 0)),
                 leverage=float(pos.get("leverage", {}).get("value", 1)),
+            ))
+
+        spot_aliases = {coin: asset for asset, coin in config.SPOT_COINS.items()}
+        for balance in spot_resp.get("balances", []):
+            coin = balance.get("coin", "")
+            total = float(balance.get("total", 0))
+            if not coin or coin == "USDC" or total == 0:
+                continue
+            asset = spot_aliases.get(coin, coin)
+            entry_notional = float(balance.get("entryNtl", 0))
+            entry_price = abs(entry_notional / total) if entry_notional else 0.0
+            mark_price = float(mids.get(config.SPOT_COINS.get(asset, ""), 0))
+            if mark_price <= 0:
+                mark_price = entry_price
+            if abs(total * mark_price) < config.MIN_POSITION_NOTIONAL_USD:
+                continue
+            positions.append(Position(
+                asset=asset,
+                market="spot",
+                side=Side.BUY if total > 0 else Side.SELL,
+                size=abs(total),
+                entry_price=entry_price or mark_price,
             ))
         return positions
 
@@ -299,6 +333,21 @@ class OrderManager:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _submit(self, order: Order) -> Optional[Order]:
+        decimals = config.SIZE_DECIMALS.get(order.asset, 4)
+        scale = 10 ** decimals
+        normalized_size = math.floor(order.size * scale + 1e-9) / scale
+        if normalized_size <= 0:
+            order.status = "error"
+            self._orders[order.client_id] = order
+            logger.error(f"Order size rounds to zero at {decimals} decimals: {order.asset} {order.size}")
+            return order
+        if normalized_size < order.size:
+            logger.warning(
+                f"Order size rounded down for {order.asset}: "
+                f"{order.size} -> {normalized_size} ({decimals} decimals)"
+            )
+            order.size = normalized_size
+
         asset_idx = (
             config.SPOT_ASSET_INDICES.get(self._spot_asset(order.asset))
             if order.market == "spot"

@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
 from feed import MarketDataFeed, BookSnapshot
-from order_manager import OrderManager, Order, Side, TIF
+from order_manager import OrderManager, Order, Position, Side, TIF
 from risk_manager import RiskManager
 from logger import logger, alert
 import config
@@ -37,12 +37,15 @@ class ArbState(str, Enum):
     ENTERING   = "entering"   # orders sent, waiting for fills
     OPEN       = "open"       # both legs filled, position live
     CLOSING    = "closing"    # close orders sent
+    UNWINDING  = "unwinding"  # failed entry exposure being reduced
+    UNHEDGED   = "unhedged"   # startup exposure is incomplete or same-sided
 
 
 @dataclass
 class ArbLeg:
     order: Optional[Order] = None
     close_order: Optional[Order] = None
+    close_filled: float = 0.0
     filled: bool = False
 
 
@@ -118,6 +121,72 @@ class PerpSpotArbStrategy:
 
     def set_trading_enabled(self, enabled: bool) -> None:
         self._trading_enabled = enabled
+
+    def adopt_positions(self, positions: List[Position]) -> None:
+        """Seed strategy state from live account positions after a restart."""
+        by_market_asset = {
+            (position.asset, position.market): position
+            for position in positions
+        }
+        for perp_asset, spot_asset in config.ARB_PAIRS:
+            perp_position = by_market_asset.get((perp_asset, "perp"))
+            spot_position = by_market_asset.get((spot_asset, "spot"))
+            if not perp_position and not spot_position:
+                continue
+
+            pos = self._positions[perp_asset]
+            pos.perp_leg = ArbLeg(
+                order=self._adopted_order(perp_asset, "perp", perp_position)
+                if perp_position else None,
+            )
+            pos.spot_leg = ArbLeg(
+                order=self._adopted_order(perp_asset, "spot", spot_position)
+                if spot_position else None,
+            )
+            pos.entry_time = time.time()
+            pos.last_status_check = 0.0
+            if (
+                perp_position
+                and spot_position
+                and perp_position.side != spot_position.side
+            ):
+                pos.state = ArbState.OPEN
+                entry_mid = (perp_position.entry_price + spot_position.entry_price) / 2
+                if entry_mid > 0:
+                    pos.entry_spread_bps = (
+                        (perp_position.entry_price - spot_position.entry_price)
+                        / entry_mid
+                        * 10_000
+                    )
+            else:
+                pos.state = ArbState.UNHEDGED
+                logger.error(
+                    f"Adopted incomplete or same-sided {perp_asset} exposure; "
+                    "automatic entries are blocked for this pair"
+                )
+            logger.info(
+                f"Adopted {perp_asset} positions: "
+                f"perp={perp_position.size if perp_position else 0:g} "
+                f"spot={spot_position.size if spot_position else 0:g} "
+                f"state={pos.state.value}"
+            )
+
+    @staticmethod
+    def _adopted_order(
+        perp_asset: str,
+        market: str,
+        position: Position,
+    ) -> Order:
+        return Order(
+            client_id=f"adopted-{perp_asset}-{market}",
+            asset=perp_asset,
+            market=market,
+            side=position.side,
+            size=position.size,
+            price=position.entry_price,
+            filled=position.size,
+            status="filled",
+        )
 
     def positions_snapshot(self) -> List[dict]:
         """Return both legs tracked by the strategy for dashboard telemetry."""
@@ -232,21 +301,24 @@ class PerpSpotArbStrategy:
                     self._last_book_diagnostic[diagnostic_key] = time.time()
                 continue
 
-            spread_bps = self._feed.get_spread_bps(perp_asset, spot_asset)
-            if spread_bps is None:
-                continue
-
             if pos.state == ArbState.FLAT:
-                await self._check_entry(pos, perp_book, spot_book, spread_bps)
+                spread_bps = self._feed.get_spread_bps(perp_asset, spot_asset)
+                if spread_bps is not None:
+                    await self._check_entry(pos, perp_book, spot_book, spread_bps)
 
             elif pos.state == ArbState.ENTERING:
                 await self._check_entry_fills(pos)
 
             elif pos.state == ArbState.OPEN:
-                await self._check_exit(pos, spread_bps, perp_book, spot_book)
+                spread_bps = self._exit_spread_bps(pos, perp_book, spot_book)
+                if spread_bps is not None:
+                    await self._check_exit(pos, spread_bps, perp_book, spot_book)
 
             elif pos.state == ArbState.CLOSING:
                 await self._check_close_fills(pos)
+
+            elif pos.state == ArbState.UNWINDING:
+                await self._check_unwind_fills(pos)
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
@@ -267,8 +339,6 @@ class PerpSpotArbStrategy:
             # Perp premium: short perp, long spot
             perp_side = Side.SELL
             spot_side = Side.BUY
-            perp_price = perp.bid_price   # sell into bid
-            spot_price = spot.ask_price   # buy at ask
         else:
             # Perp discount: long perp, short spot
             if not config.ALLOW_SPOT_SELL:
@@ -276,12 +346,15 @@ class PerpSpotArbStrategy:
                 return
             perp_side = Side.BUY
             spot_side = Side.SELL
-            perp_price = perp.ask_price   # buy at ask
-            spot_price = spot.bid_price   # sell into bid
 
-        # Size: use conservative size based on limits
-        # Both legs share this size; cap against the more expensive leg.
+        perp_price = self._marketable_price(perp, perp_side)
+        spot_price = self._marketable_price(spot, spot_side)
         size = self._calc_size(pos.asset, max(perp_price, spot_price))
+        perp_liquidity = perp.bid_size if perp_side == Side.SELL else perp.ask_size
+        spot_liquidity = spot.ask_size if spot_side == Side.BUY else spot.bid_size
+        size = min(size, perp_liquidity, spot_liquidity)
+        size_scale = 10 ** config.SIZE_DECIMALS.get(pos.asset, 4)
+        size = math.floor(size * size_scale) / size_scale
         if size <= 0:
             return
 
@@ -339,48 +412,16 @@ class PerpSpotArbStrategy:
         spot_order: Optional[Order],
     ) -> None:
         """Close confirmed fills when the paired entry leg fails."""
-        unwind_orders = []
-        for order, market in ((perp_order, "perp"), (spot_order, "spot")):
-            if not order or order.filled <= 0:
-                unwind_orders.append(None)
-                continue
-            spot_asset = next((spot for perp, spot in config.ARB_PAIRS if perp == pos.asset), pos.asset)
-            book = self._feed.get_book(pos.asset if market == "perp" else spot_asset, market)
-            if not book:
-                logger.critical(f"Cannot unwind filled {pos.asset} {market}: no book")
-                unwind_orders.append(None)
-                continue
-            close_side = Side.BUY if order.side == Side.SELL else Side.SELL
-            unwind_orders.append(await self._orders.place_market(
-                pos.asset,
-                close_side,
-                order.filled,
-                market=market,
-                reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
-                price=self._marketable_price(book, close_side),
-            ))
-
-        active_unwinds = [order for order in unwind_orders if order is not None]
-        if not active_unwinds:
-            pos.state = ArbState.FLAT
-            return
-
-        # IOC unwind orders should resolve immediately. Keep the position in
-        # CLOSING until every compensating order is terminal.
-        await asyncio.gather(*[
-            self._orders.refresh_order(order) for order in active_unwinds
-        ])
-        if all(order.status in ("filled", "cancelled") for order in active_unwinds):
-            logger.info(f"Failed entry unwound for {pos.asset}")
-            pos.state = ArbState.FLAT
-            return
-
-        logger.critical(f"Failed entry could not be fully unwound for {pos.asset}")
-        pos.perp_leg = ArbLeg(order=unwind_orders[0])
-        pos.spot_leg = ArbLeg(order=unwind_orders[1])
+        pos.perp_leg = ArbLeg(order=perp_order)
+        pos.spot_leg = ArbLeg(order=spot_order)
         pos.entry_time = time.time()
         pos.last_status_check = 0.0
-        pos.state = ArbState.CLOSING
+        pos.state = ArbState.UNWINDING
+        await self._check_unwind_fills(pos)
+        if pos.state == ArbState.UNWINDING:
+            logger.critical(
+                f"Failed entry still has exposure for {pos.asset}; retrying unwind"
+            )
 
     async def _check_entry_fills(self, pos: ArbPosition) -> None:
         """Wait for both legs to fill. Cancel and reset if one leg times out."""
@@ -390,6 +431,16 @@ class PerpSpotArbStrategy:
                 self._orders.refresh_order(pos.spot_leg.order),
             )
             pos.last_status_check = time.time()
+
+        if any(
+            leg.order is None or leg.order.status in ("error", "cancelled")
+            for leg in (pos.perp_leg, pos.spot_leg)
+        ):
+            logger.error(f"Entry leg rejected for {pos.asset}; unwinding confirmed fills")
+            await self._unwind_entry_fills(
+                pos, pos.perp_leg.order, pos.spot_leg.order,
+            )
+            return
 
         perp_filled = pos.perp_leg.order and pos.perp_leg.order.status == "filled"
         spot_filled = pos.spot_leg.order and pos.spot_leg.order.status == "filled"
@@ -426,42 +477,66 @@ class PerpSpotArbStrategy:
             for leg in (pos.perp_leg, pos.spot_leg):
                 if leg.order and leg.order.status == "open":
                     await self._orders.cancel(leg.order)
+            await self._unwind_entry_fills(
+                pos, pos.perp_leg.order, pos.spot_leg.order,
+            )
 
-            # Never leave a partially filled leg exposed after the other leg
-            # times out. Close only the quantity confirmed filled by the exchange.
-            unwind_orders = []
-            for leg, market in (
-                (pos.perp_leg, "perp"),
-                (pos.spot_leg, "spot"),
-            ):
-                order = leg.order
-                if not order or order.filled <= 0:
-                    unwind_orders.append(None)
-                    continue
-                spot_asset = next((spot for perp, spot in config.ARB_PAIRS if perp == pos.asset), pos.asset)
-                book = self._feed.get_book(pos.asset if market == "perp" else spot_asset, market)
-                if not book:
-                    logger.error(f"Cannot unwind partial {pos.asset} {market}: no book")
-                    unwind_orders.append(None)
-                    continue
-                close_side = Side.BUY if order.side == Side.SELL else Side.SELL
-                unwind_orders.append(await self._orders.place_market(
-                    pos.asset,
-                    close_side,
-                    order.filled,
-                    market=market,
-                    reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
-                    price=self._marketable_price(book, close_side),
-                ))
+    async def _check_unwind_fills(self, pos: ArbPosition) -> None:
+        if time.time() - pos.last_status_check < 0.5:
+            return
+        pos.last_status_check = time.time()
 
-            if any(unwind_orders):
-                pos.perp_leg = ArbLeg(order=unwind_orders[0])
-                pos.spot_leg = ArbLeg(order=unwind_orders[1])
-                pos.entry_time = time.time()
-                pos.last_status_check = 0.0
-                pos.state = ArbState.CLOSING
-            else:
-                pos.state = ArbState.FLAT
+        spot_asset = next(
+            (spot for perp, spot in config.ARB_PAIRS if perp == pos.asset),
+            pos.asset,
+        )
+        tolerance = 10 ** -config.SIZE_DECIMALS.get(pos.asset, 4)
+        for leg, market, asset in (
+            (pos.perp_leg, "perp", pos.asset),
+            (pos.spot_leg, "spot", spot_asset),
+        ):
+            entry_order = leg.order
+            if not entry_order or entry_order.filled <= 0:
+                continue
+
+            close_order = leg.close_order
+            if close_order:
+                await self._orders.refresh_order(close_order)
+                if close_order.status in ("pending", "open"):
+                    continue
+                leg.close_filled += close_order.filled
+                leg.close_order = None
+
+            remaining = max(0.0, entry_order.filled - leg.close_filled)
+            if remaining <= tolerance:
+                continue
+
+            book = self._feed.get_book(asset, market)
+            if not book or book.is_stale():
+                continue
+
+            close_side = Side.BUY if entry_order.side == Side.SELL else Side.SELL
+            leg.close_order = await self._orders.place_market(
+                pos.asset,
+                close_side,
+                remaining,
+                market=market,
+                reduce_only=market == "perp" and config.REDUCE_ONLY_ON_CLOSE,
+                price=self._marketable_price(
+                    book, close_side, config.UNWIND_SLIPPAGE_BPS,
+                ),
+            )
+
+        all_reduced = all(
+            not leg.order
+            or leg.order.filled - leg.close_filled <= tolerance
+            for leg in (pos.perp_leg, pos.spot_leg)
+        )
+        if all_reduced:
+            logger.info(f"Failed entry unwound for {pos.asset}")
+            pos.state = ArbState.FLAT
+            pos.perp_leg = ArbLeg()
+            pos.spot_leg = ArbLeg()
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
@@ -472,7 +547,13 @@ class PerpSpotArbStrategy:
         perp_book: BookSnapshot,
         spot_book: BookSnapshot,
     ) -> None:
-        should_close = abs(spread_bps) <= config.CLOSE_SPREAD_BPS
+        perp_entry = pos.perp_leg.order
+        if not perp_entry:
+            return
+        if perp_entry.side == Side.SELL:
+            should_close = spread_bps <= config.CLOSE_SPREAD_BPS
+        else:
+            should_close = spread_bps >= -config.CLOSE_SPREAD_BPS
 
         if not should_close:
             return
@@ -564,10 +645,37 @@ class PerpSpotArbStrategy:
             pos.state = ArbState.OPEN
 
     @staticmethod
-    def _marketable_price(book: BookSnapshot, side: Side) -> float:
+    def _exit_spread_bps(
+        pos: ArbPosition,
+        perp: BookSnapshot,
+        spot: BookSnapshot,
+    ) -> Optional[float]:
+        perp_entry = pos.perp_leg.order
+        if not perp_entry:
+            return None
+        if perp_entry.side == Side.SELL:
+            perp_price, spot_price = perp.ask_price, spot.bid_price
+        else:
+            perp_price, spot_price = perp.bid_price, spot.ask_price
+        mid = (perp_price + spot_price) / 2
+        if perp_price <= 0 or spot_price <= 0 or mid <= 0:
+            return None
+        return (perp_price - spot_price) / mid * 10_000
+
+    @staticmethod
+    def _marketable_price(
+        book: BookSnapshot,
+        side: Side,
+        slippage_bps: Optional[float] = None,
+    ) -> float:
         """Create a valid IOC limit price that crosses the current book."""
         reference = book.ask_price if side == Side.BUY else book.bid_price
-        slippage = config.SLIPPAGE_TOLERANCE_BPS / 10_000
+        tolerance = (
+            config.SLIPPAGE_TOLERANCE_BPS
+            if slippage_bps is None
+            else slippage_bps
+        )
+        slippage = tolerance / 10_000
         price = reference * (1 + slippage if side == Side.BUY else 1 - slippage)
         if price <= 0:
             return 0.0

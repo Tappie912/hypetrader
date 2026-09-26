@@ -51,10 +51,17 @@ class RiskManager:
         self._check_daily_loss()
 
     def update_positions(self, positions: List[Position]) -> None:
-        self._position_notionals = {
-            f"{p.asset}_{p.market}": p.size * p.entry_price
-            for p in positions
-        }
+        spot_to_perp = {spot: perp for perp, spot in config.ARB_PAIRS}
+        self._position_notionals = {}
+        for position in positions:
+            asset = (
+                spot_to_perp.get(position.asset, position.asset)
+                if position.market == "spot"
+                else position.asset
+            )
+            self._position_notionals[f"{asset}_{position.market}"] = (
+                position.size * position.entry_price
+            )
 
     def check_order(
         self,

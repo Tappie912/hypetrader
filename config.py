@@ -40,6 +40,7 @@ if not ACCOUNT_ADDRESS or not PRIVATE_KEY:
 MAX_POSITION_USD        = 600        # max notional per position in USD
 MAX_TOTAL_EXPOSURE_USD  = 600        # max total open notional across all positions
 MAX_ORDER_USD           = 250         # max single order size
+MIN_POSITION_NOTIONAL_USD = 0.25      # ignore residual positions below this notional
 MAX_DAILY_LOSS_USD      = 50         # halt trading if daily PnL drops below this
 MAX_DRAWDOWN_PCT        = 0.1          # 10% max drawdown before halt
 
@@ -48,6 +49,7 @@ MAX_DRAWDOWN_PCT        = 0.1          # 10% max drawdown before halt
 MIN_SPREAD_BPS          = 22             # minimum spread in basis points to enter
 CLOSE_SPREAD_BPS        = 1             # spread at which to close the arb
 SLIPPAGE_TOLERANCE_BPS  = 1            # max acceptable slippage
+UNWIND_SLIPPAGE_BPS     = 25           # emergency exposure reduction tolerance
 ALLOW_SPOT_SELL         = False       # spot sells require the asset in the account
 
 # Markets to watch — (perp_asset, spot_asset) pairs
@@ -58,6 +60,7 @@ ARB_PAIRS = [
     ("SOL", "SOL"),   # SOL perp vs SOL spot
     ("HYPE", "HYPE"), # HYPE perp vs HYPE spot
     ("ZEC", "UZEC"),  # ZEC perp vs Unit Zcash spot
+    ("SPX", "UUUSPX"), # SPX perp vs Unit SPX6900 spot
 ]
 
 # Hyperliquid spot market identifiers for the wrapped assets above.
@@ -67,6 +70,7 @@ SPOT_COINS = {
     "SOL": "@156",
     "HYPE": "@107",
     "UZEC": "@272",
+    "UUUSPX": "@193",
 }
 
 # Spot order asset indices are 10000 plus the spotMeta universe index.
@@ -76,6 +80,7 @@ SPOT_ASSET_INDICES = {
     "SOL": 10_156,
     "HYPE": 10_107,
     "UZEC": 10_272,
+    "UUUSPX": 10_193,
 }
 
 # Shared perp/spot size precision uses the stricter precision of each pair.
@@ -85,6 +90,7 @@ SIZE_DECIMALS = {
     "SOL": 2,
     "HYPE": 2,
     "ZEC": 2,
+    "SPX": 1,
 }
 
 # ── Order management ──────────────────────────────────────────────────────────
